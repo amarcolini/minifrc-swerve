@@ -1,0 +1,17 @@
+CompileFlags:
+  # Instruct clangd to allow querying the PlatformIO toolchains
+  QueryDriver:
+    - "/Users/your_username/.platformio/packages/toolchain-*/**"
+    - "C:/Users/your_username/.platformio/packages/toolchain-*/**"
+  
+  # Remove flags that gcc understands but clangd complains about
+  Remove: 
+    - -fno-tree-switch-conversion
+    - -mtext-section-literals
+    - -mlongcalls
+    - -fstrict-volatile-bitfields
+    - -free
+    - -fipa-pta
+    - -march=*
+    - -mabi=*
+    - -mdisable-hardware-atomics

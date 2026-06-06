@@ -1,0 +1,416 @@
+#include "Alfredo_NoU3.h"
+#include "Arduino.h"
+#include "MT6701.h"
+#include "PestoLink-Receive.h"
+#include "Wire.h"
+#include "esp32-hal.h"
+#include <cmath>
+
+NoU_Motor motor1(1), motor2(2), motor3(3), motor4(4), motor5(5), motor6(6),
+    intake(7);
+NoU_Servo arm(3), bend(2), twist(1);
+
+// Replace 10 with whichever third pin you managed to free up
+// const int PWM_PINS[3] = {8, 9, 10}; 
+
+// // --- VOLATILE DATA ---
+// // Using uint32_t to store the raw CPU clock ticks
+// volatile uint32_t pulse_start_ticks[3] = {0, 0, 0};
+// volatile uint32_t current_pulse_width_ticks[3] = {0, 0, 0};
+
+// // --- INTERRUPT SERVICE ROUTINES (ISRs) ---
+// // We need exactly one ISR per pin. 
+// // IRAM_ATTR keeps these in fast RAM to prevent interrupt latency.
+
+// void IRAM_ATTR pod0_isr() {
+//   if (digitalRead(PWM_PINS[0])) {
+//     pulse_start_ticks[0] = xthal_get_ccount(); // HIGH: Record start ticks
+//   } else {
+//     current_pulse_width_ticks[0] = xthal_get_ccount() - pulse_start_ticks[0]; // LOW: Calculate width
+//   }
+// }
+
+// void IRAM_ATTR pod1_isr() {
+//   if (digitalRead(PWM_PINS[1])) {
+//     pulse_start_ticks[1] = xthal_get_ccount();
+//   } else {
+//     current_pulse_width_ticks[1] = xthal_get_ccount() - pulse_start_ticks[1];
+//   }
+// }
+
+// void IRAM_ATTR pod2_isr() {
+//   if (digitalRead(PWM_PINS[2])) {
+//     pulse_start_ticks[2] = xthal_get_ccount();
+//   } else {
+//     current_pulse_width_ticks[2] = xthal_get_ccount() - pulse_start_ticks[2];
+//   }
+// }
+
+// STATES
+double state = 0;
+double rest = 0;
+double L1 = 1;
+double L2 = 2;
+double L3 = 3;
+
+// Servo states for easing
+double armTarget = 0;
+double armState = 0;
+
+// Variables
+double armRest = 0;
+double armL1 = 20;
+double armL2 = 40;
+double armL3 = 60;
+
+double bendRest = 100;
+double bendL1 = 80;
+double bendL2 = 40;
+double bendL3 = 60;
+
+double twistRest = 80;
+double twistL1 = 80;
+double twistL2 = 40;
+double twistL3 = 60;
+
+MT6701 left_encoder;
+MT6701 right_encoder;
+MT6701 front_encoder;
+
+#define TCAADDR 0x70
+
+void tcaselect(uint8_t i) {
+  if (i > 7)
+    return;
+
+  Wire.beginTransmission(TCAADDR);
+  Wire.write(1 << i);
+  Wire.endTransmission();
+}
+
+class swervepod {
+public:
+  double p = 0.006, d = 0.0;
+  double target = 0.0;
+  double last_power = 0.0;
+  double mult = 1.0;
+  double last_rotation = 0.0;
+  unsigned long last_time;
+  double last_error = 0.0;
+  NoU_Motor &rotation, &drive;
+
+  swervepod(NoU_Motor &rotation, NoU_Motor &drive)
+      : rotation(rotation), drive(drive) {
+    last_time = micros();
+  }
+
+  void update(double angle, double power) {
+    if (angle == NAN) {
+      rotation.set(0.0);
+      drive.set(0.0);
+      return;
+    }
+    double dT = (micros() - last_time) / 1000000.0;
+    double error = fmod(target - angle + 180.0, 360.0) - 180.0;
+    if (error < -180.0) {
+      error += 360.0;
+    }
+    mult = -1.0;
+    if (error > 90.0)
+      error -= 180.0;
+    else if (error < -90.0)
+      error += 180.0;
+    else
+      mult = 1.0;
+    // double mult = 1.0;
+    // PestoLink.printfTerminal("%.2f, %.2f", angle, error);
+    if (abs(error) > 3.0) {
+      double output = -1.0 * ((p * error) + (d * (error - last_error) / dT));
+      if (output > 0.01) {
+        output += 0.1;
+      } else if (output < -0.01) {
+        output += -0.1;
+      }
+      last_rotation += constrain(output - last_rotation, dT * -6.0, dT * 6.0);
+      rotation.set(output);
+    } else {
+      rotation.set(0.0);
+      last_rotation = 0.0;
+    }
+    double target_power = power * cos(error * PI / 180.0);
+    last_power += constrain(mult * power - last_power, dT * -3.0, dT * 3.0);
+    last_power = constrain(last_power, -0.5, 0.5);
+    drive.set(last_power);
+    last_error = error;
+    last_time = micros();
+  }
+
+  void drive_direction(double power) {
+    drive.set(power * mult);
+    rotation.set(0.0);
+  }
+
+  void disable() {
+    drive.set(0.0);
+    rotation.set(0.0);
+  }
+};
+
+// swervepod pod(motor1, motor6);
+
+void setup() { // put your setup code here, to run once
+
+  NoU3.begin();
+  PestoLink.begin("ReefSON😭🥀");
+
+  arm.write(60);
+  armTarget = 60;
+  armState = 60;
+  bend.write(bendRest);
+  twist.write(twistRest);
+
+  Wire.end();
+  Wire.begin(6, 5);
+  Wire.setTimeOut(10);
+  delay(1000);
+
+  left_encoder.initializeI2C(&Wire);
+  right_encoder.initializeI2C(&Wire);
+  right_encoder.pwmModeSet();
+  front_encoder.initializeI2C(&Wire);
+  Serial.begin(9600);
+  Serial.println("Hello:)");
+
+  // tcaselect(0);
+  // delayMicroseconds(50);
+  // left_encoder.analogModeSet();
+  // left_encoder.programmEEPROM();
+  // tcaselect(1);
+  // delayMicroseconds(50);
+  // right_encoder.analogModeSet();
+  // right_encoder.programmEEPROM();
+  // tcaselect(2);
+  // delayMicroseconds(50);
+  // front_encoder.analogModeSet();
+  // front_encoder.programmEEPROM();
+
+  // for (int i = 0; i < 3; i++) {
+  //   pinMode(PWM_PINS[i], INPUT);
+  // }
+  
+  // attachInterrupt(digitalPinToInterrupt(PWM_PINS[0]), pod0_isr, CHANGE);
+  // attachInterrupt(digitalPinToInterrupt(PWM_PINS[1]), pod1_isr, CHANGE);
+  // attachInterrupt(digitalPinToInterrupt(PWM_PINS[2]), pod2_isr, CHANGE);
+}
+
+// TCA9548 multiplexer(0x70, &i2c);
+
+void toL3() {
+  arm.write(armL3);
+  bend.write(bendL3);
+  twist.write(twistL3);
+}
+void toL2() {
+  arm.write(armL2);
+  bend.write(bendL2);
+  twist.write(twistL2);
+}
+void toL1() {
+  arm.write(armL1);
+  bend.write(bendL1);
+  twist.write(twistL1);
+}
+void toRest() {
+  arm.write(armRest);
+  bend.write(bendRest);
+  twist.write(twistRest);
+}
+
+// NoU_Motor *motors[] = {&motor1, &motor2, &motor3, &motor4, &motor5, &motor6};
+
+swervepod front_pod(motor4, motor3);
+swervepod left_pod(motor2, motor1);
+swervepod right_pod(motor5, motor6);
+
+// swervepod front_pod(motor3, motor4);
+// swervepod left_pod(motor1, motor2);
+// swervepod right_pod(motor6, motor5);
+
+unsigned long last_time = millis();
+void loop() { // put your main code here, to run repeatedly
+              // DRIVETRAIN
+  double forward = -1 * PestoLink.getAxis(1);
+  double strafe = PestoLink.getAxis(0);
+  double turn = PestoLink.getAxis(2);
+
+  // Array to hold the safe copies of the data
+  // uint32_t safe_ticks[3];
+  // float pod_angles[3];
+
+  // // 1. Briefly disable interrupts to grab all three values safely
+  // noInterrupts();
+  // for (int i = 0; i < 3; i++) {
+  //   safe_ticks[i] = current_pulse_width_ticks[i];
+  // }
+  // interrupts();
+
+  // // 2. Convert raw CPU ticks to degrees
+  // // The ESP32 on the NoU3 runs at 240 MHz (240 ticks per microsecond)
+  // // These min/max values are estimates for the MT6701 at 240MHz. 
+  // // You will need to calibrate these exact tick values by physically turning the pod to 0 and 360.
+  // float min_ticks = 10.0 * 240.0;  // 10us * 240 ticks/us
+  // float max_ticks = 240.0 * 240.0; // 240us * 240 ticks/us
+
+  // for (int i = 0; i < 3; i++) {
+  //   // Constrain to prevent weird wrap-around math if a pulse is slightly out of bounds
+  //   float constrained_ticks = constrain((float)safe_ticks[i], min_ticks, max_ticks);
+    
+  //   // Map ticks to 0-360 degrees
+  //   pod_angles[i] = (constrained_ticks - min_ticks) / (max_ticks - min_ticks) * 360.0;
+    
+  //   Serial.print("Pod "); Serial.print(i); Serial.print(": "); Serial.print(pod_angles[i]); Serial.print("°\t");
+  // }
+  // Serial.println();
+
+  // Read angles from sensors with multiplexer
+  tcaselect(0);
+  delayMicroseconds(50);
+  double left_angle = left_encoder.angleRead();
+  left_angle = left_angle != 0 ? -left_angle + 242.20 : NAN;
+  tcaselect(1);
+  delayMicroseconds(50);
+  double right_angle = right_encoder.angleRead();
+  right_angle = right_angle != 0 ? right_angle - 0.73 : NAN;
+  tcaselect(2);
+  delayMicroseconds(50);
+  double front_angle = front_encoder.angleRead();
+  front_angle = front_angle != 0 ? -front_angle + 272.88 : NAN;
+  Serial.print(left_angle);
+  Serial.print(" ");
+  Serial.print(right_angle);
+  Serial.print(" ");
+  Serial.println(front_angle);
+
+  // Velocity calculations
+  double vx = forward;
+  double vy = strafe;
+  double omega = 0.0;
+  if (PestoLink.buttonHeld(2)) {
+    omega = 1.0;
+  } else if (PestoLink.buttonHeld(1)) {
+    omega = -1.0;
+  }
+
+  right_pod.drive.setInverted(true);
+
+  double positions[][2] = {
+      {-0.5, -sqrt(3) / 2.0}, {-0.5, sqrt(3) / 2.0}, {1.0, 0.0}};
+  double angles[] = {left_angle, right_angle, front_angle};
+  swervepod *pods[] = {&left_pod, &right_pod, &front_pod};
+  if (PestoLink.isConnected()) {
+    if (abs(vx) + abs(vy) + abs(omega) > 0.2) {
+      for (int i = 0; i <= 2; i++) {
+        double x = vx - positions[i][1] * omega;
+        double y = vy + positions[i][0] * omega;
+        double vel = sqrt(x * x + y * y);
+        if (vel > 0.2) {
+          double angle = atan2(y, x) * 180.0 / PI;
+          if (i == 1) {
+            angle *= -1.0;
+          }
+          pods[i]->target = angle;
+        }
+        pods[i]->update(angles[i], vel * (i == 1 ? -0.25 : 0.25));
+        // if (i == 2) {
+        //   PestoLink.printfTerminal("%.2f, %.2f", x, y);
+        // }
+      }
+    } else if (PestoLink.buttonHeld(0)) {
+      for (int i = 0; i <= 2; i++) {
+        pods[i]->drive_direction(i == 1 ? -0.5 : 0.5);
+      }
+    } else if (PestoLink.buttonHeld(3)) {
+      for (int i = 0; i <= 2; i++) {
+        pods[i]->drive_direction(i == 1 ? 0.25 : -0.25);
+      }
+    } else {
+      for (int i = 0; i <= 2; i++) {
+        pods[i]->drive_direction(0.0);
+      }
+    }
+  } else {
+    front_pod.disable();
+    left_pod.disable();
+    right_pod.disable();
+  }
+
+  // if (PestoLink.buttonHeld(7)) {
+  //   left_pod.drive.set(1.0);
+  // } else {
+  //   left_pod.drive.set(0.0);
+  // }
+
+  PestoLink.printfTerminal(
+      "%.2f|| %.2f,%.2f,%.2f | %.2f,%.2f,%.2f | %.2f,%.2f,%.2f",
+      NoU3.getBatteryVoltage(), left_pod.target, left_angle,
+      left_pod.last_error, right_pod.target, right_angle, right_pod.last_error,
+      front_pod.target, front_angle, front_pod.last_error);
+
+  // CLAW
+  // if (PestoLink.buttonHeld(0)) {
+  //   intake.set(1);
+  //   PestoLink.printfTerminal("CLAW MOVE PLEASE");
+  // } else if (PestoLink.buttonHeld(1)) {
+  //   intake.set(-1);
+  // } else {
+  //   intake.set(0);
+  // }
+
+  // for (int i = 0; i < 5; i++) {
+  //   if (PestoLink.buttonHeld(i + 4)) {
+  //     motors[i]->set(1);
+  //   } else {
+  //     motors[i]->set(0);
+  //   }
+  // }
+
+  // motor3.set(1.0);
+
+  // if (PestoLink.buttonHeld(5)) {
+  //   armTarget = 15;
+  // } else {
+  //   armTarget = 60;
+  // }
+
+  // if (PestoLink.buttonHeld(6)) {
+  //   bend.write(180.0);
+  // } else {
+  //   bend.write(0.0);
+  // }
+
+  // if (PestoLink.buttonHeld(7)) {
+  //   twist.write(180.0);
+  // } else {
+  //   twist.write(0.0);
+  // }
+
+  // // ARM
+  // if (PestoLink.buttonHeld(12)) {
+  //   toL3();
+  // }
+  // if (PestoLink.buttonHeld(15)) {
+  //   toL2();
+  // }
+  // if (PestoLink.buttonHeld(14)) {
+  //   toL1();
+  // }
+  // if (PestoLink.buttonHeld(13)) {
+  //   toRest();
+  // }
+
+  double armError = armTarget - armState;
+  double dt = (millis() - last_time) / 1000.0;
+  armState += dt * constrain(armError * 0.5, -20.0, 20.0);
+  arm.write(armState);
+  last_time = millis();
+}
